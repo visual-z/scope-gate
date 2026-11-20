@@ -1,0 +1,26 @@
+# Evidence and samples stay local
+samples/*
+!samples/README.md
+artifacts/*
+!artifacts/README.md
+
+# Secrets and captures
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+*.pcap
+*.pcapng
+*.har
+*.dmp
+*.core
+
+# Tool and OS state
+.DS_Store
+__pycache__/
+*.pyc
+.xeno/
+.idea/
+.vscode/

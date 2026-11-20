@@ -1,0 +1,30 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  scope-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Self-test
+        run: bash tests/run.sh
+      - name: Template must ship unapproved
+        run: |
+          if bin/scope-check --quiet; then
+            echo "SCOPE.md ships APPROVED; a template must ship DRAFT"
+            exit 1
+          fi
+      - name: Example scope is complete but expired
+        run: |
+          out="$(bin/scope-check --file docs/example-scope.md 2>&1 || true)"
+          case "$out" in
+            *expired*) echo "ok: $out" ;;
+            *) echo "unexpected: $out"; exit 1 ;;
+          esac

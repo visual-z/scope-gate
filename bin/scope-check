@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# scope-check - lint an engagement scope file.
+#
+# Not a security control. It answers one narrow question: does SCOPE.md record a
+# complete, currently-approved authorization window? Absence of approval is a
+# stop condition, so every ambiguity resolves to BLOCKED.
+#
+# Usage: bin/scope-check [--file PATH] [--quiet] [--now EPOCH]
+# Exit:  0 approved and open, 1 blocked or incomplete, 2 usage error.
+
+set -u
+
+FILE="SCOPE.md"
+QUIET=0
+NOW="${SCOPE_CHECK_NOW:-$(date -u +%s)}"
+
+usage() {
+  sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --file) FILE="${2:-}"; shift 2 || { usage; exit 2; } ;;
+    --file=*) FILE="${1#*=}"; shift ;;
+    --quiet|-q) QUIET=1; shift ;;
+    --now) NOW="${2:-}"; shift 2 || { usage; exit 2; } ;;
+    --now=*) NOW="${1#*=}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "scope-check: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+case "$NOW" in
+  ''|*[!0-9]*) echo "scope-check: --now must be a unix epoch" >&2; exit 2 ;;
+esac
+
+problems=()
+problem() { problems+=("$1"); }
+
+# section NAME: print the body of "## NAME" up to the next "## " heading.
+section() {
+  awk -v want="$2" '
+    BEGIN { lower = tolower(want) }
+    /^##[[:space:]]+/ {
+      title = tolower($0); sub(/^##[[:space:]]+/, "", title); sub(/[[:space:]]+$/, "", title)
+      inside = (title == lower); next
+    }
+    inside { print }
+  ' "$1"
+}
+
+# field NAME FILE: the value after "- NAME:" on the first matching line.
+field() {
+  awk -v want="$2" '
+    BEGIN { lower = tolower(want) }
+    {
+      line = $0; sub(/^[[:space:]]*[-*][[:space:]]*/, "", line)
+      split(line, kv, ":"); key = tolower(kv[1]); sub(/[[:space:]]+$/, "", key)
+      if (key != lower) next
+      val = substr(line, length(kv[1]) + 2)
+      sub(/^[[:space:]]+/, "", val); sub(/[[:space:]]+$/, "", val)
+      print val; exit
+    }
+  ' "$1"
+}
+
+# listed FILE SECTION: number of bullet lines with non-empty content.
+listed() {
+  section "$1" "$2" | awk '
+    /^[[:space:]]*[-*][[:space:]]*\[[ xX]\]/ {
+      line = $0; sub(/^[[:space:]]*[-*][[:space:]]*\[[ xX]\][[:space:]]*/, "", line)
+      if (line != "") n++
+      next
+    }
+    /^[[:space:]]*[-*][[:space:]]*[^[:space:]]/ {
+      line = $0; sub(/^[[:space:]]*[-*][[:space:]]*/, "", line)
+      if (line != "" && line !~ /^[[:space:]]*$/) n++
+    }
+    END { print n + 0 }'
+}
+
+# checked FILE SECTION: number of checked "- [x]" boxes.
+checked() {
+  section "$1" "$2" | grep -cE '^[[:space:]]*[-*][[:space:]]*\[[xX]\]' || true
+}
+
+# to_epoch "YYYY-MM-DD HH:MM" -> seconds, or fail. Always UTC; offsets are not
+# interpreted, so a literal offset is reported rather than guessed at.
+to_epoch() {
+  local ts="$1" out
+  ts="$(printf '%s' "$ts" | sed 's/[[:space:]]*$//; s/[[:space:]]UTC$//; s/[Zz]$//; s/T/ /')"
+  case "$ts" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ts="$ts 00:00" ;;
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ [0-9][0-9]:[0-9][0-9]) ;;
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ [0-9][0-9]:[0-9][0-9]:[0-9][0-9]) ts="${ts%:*}" ;;
+    *) return 1 ;;
+  esac
+  case "$ts" in *[+-][0-9][0-9]:[0-9][0-9]) echo "scope-check: note: UTC offset in '$1' is ignored" >&2; ts="${ts%[+-][0-9][0-9]:[0-9][0-9]}" ;; esac
+  if out="$(date -u -d "$ts" +%s 2>/dev/null)"; then echo "$out"; return 0; fi
+  if out="$(date -u -j -f '%Y-%m-%d %H:%M' "$ts" +%s 2>/dev/null)"; then echo "$out"; return 0; fi
+  return 1
+}
+
+[ -f "$FILE" ] || { echo "Scope gate: BLOCKED"; echo "  - $FILE not found"; exit 1; }
+
+if ! grep -qiE '^[[:space:]]*Status:' "$FILE"; then
+  problem "no 'Status:' line"
+else
+  status="$(field "$FILE" 'Status')"
+  case "$(printf '%s' "$status" | tr '[:upper:]' '[:lower:]')" in
+    approved) ;;
+    '') problem "Status is empty" ;;
+    *) problem "Status is '$status', not 'APPROVED'" ;;
+  esac
+fi
+
+required_fields=(
+  "Engagement name"
+  "Authorizing organization/person"
+  "Operator"
+  "Written authorization evidence path or reference"
+  "Approval date"
+  "Start time and timezone"
+  "End time and timezone"
+  "Emergency/stop contact"
+)
+empty=()
+for f in "${required_fields[@]}"; do
+  v="$(field "$FILE" "$f")"
+  [ -n "$v" ] || empty+=("$f")
+done
+[ ${#empty[@]} -eq 0 ] || problem "required field(s) empty: $(printf '%s, ' "${empty[@]}" | sed 's/, $//')"
+
+assets="$(listed "$FILE" 'In-Scope Assets')"
+[ "$assets" -gt 0 ] || problem "no in-scope assets listed"
+
+[ "$(checked "$FILE" 'Allowed Techniques')" -gt 0 ] || problem "no allowed technique checked"
+
+stops="$(section "$FILE" 'Operational Limits' | awk '/^[[:space:]]*[-*][[:space:]]*[Ss]top conditions/ {
+    line = $0; sub(/^[^:]*:[[:space:]]*/, "", line); if (line != "") n++ } END { print n + 0 }')"
+[ "${stops:-0}" -gt 0 ] || problem "no stop conditions recorded"
+
+start_raw="$(field "$FILE" 'Start time and timezone')"
+end_raw="$(field "$FILE" 'End time and timezone')"
+if [ -n "$start_raw" ] && [ -n "$end_raw" ]; then
+  if ! start_epoch="$(to_epoch "$start_raw")"; then
+    problem "cannot parse start time '$start_raw' (use YYYY-MM-DD HH:MM, UTC)"
+  elif ! end_epoch="$(to_epoch "$end_raw")"; then
+    problem "cannot parse end time '$end_raw' (use YYYY-MM-DD HH:MM, UTC)"
+  elif [ "$start_epoch" -ge "$end_epoch" ]; then
+    problem "start time is not before end time"
+  elif [ "$NOW" -lt "$start_epoch" ]; then
+    problem "window has not opened yet (starts $start_raw)"
+  elif [ "$NOW" -ge "$end_epoch" ]; then
+    problem "window has expired (ended $end_raw) - get renewed approval"
+  fi
+fi
+
+if [ ${#problems[@]} -eq 0 ]; then
+  [ "$QUIET" -eq 1 ] || { echo "Scope gate: OPEN"; echo "  - $FILE approved for the current window"; }
+  exit 0
+fi
+
+if [ "$QUIET" -eq 0 ]; then
+  echo "Scope gate: BLOCKED"
+  for p in "${problems[@]}"; do echo "  - $p"; done
+  echo
+  echo "Offline analysis, planning, and synthetic local fixtures remain allowed."
+fi
+exit 1
